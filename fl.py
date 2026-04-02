@@ -3,7 +3,7 @@ import time
 import copy
 import random
 from typing import Any, Dict
-
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,10 +18,7 @@ from utils.util_model import (
     ipm_attack_craft_model,
     scaling_attack,
     alie_attack,
-    front_layer_attack,
-    gradient_shift_attack,
     badnets,
-    pgd_attack,
     low_rank_attack,
 )
 from utils.util_model import get_server_model
@@ -34,8 +31,6 @@ from utils.util_fusion import (
     fusion_median,
     fusion_trimmed_mean,
     fusion_dual_defense,
-    fusion_dual_defense2,
-    fusion_dual_defense3,
     drift_defense,
 )
 from utils.util_logger import logger
@@ -322,6 +317,16 @@ class SimulationFL(ABC):
         logger.info("end the FL simulation")
         logger.info("summarization - simulation metrics: {}".format(self.metrics))
         self.tensorboard.close()
+        # ===== 在所有轮次结束后，收集并保存所有 test_acc =====
+        all_acc = []
+        for r in range(self.training_round):
+            if "server" in self.metrics[r] and "test_acc" in self.metrics[r]["server"]:
+                all_acc.append(self.metrics[r]["server"]["test_acc"])
+        timestamp = time.strftime("%Y%m%d_%H%M", time.localtime())
+        # 保存到文件
+        with open(f"test_acc_log_{self.fusion}_{self.dataset}_{self.attacker_strategy}_{timestamp}.json", "w") as f:
+            json.dump(all_acc, f)
+        logger.info("All rounds test accuracy saved to test_acc_log.json")
 
     def client_local_train(
         self, round_idx: int, client_id: int, client_model: nn.Module
@@ -475,36 +480,6 @@ class SimulationFL(ABC):
             )
             return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
         elif (
-            self.attacker_strategy == "front_layer_attack"
-            and client_id in self.attacker_list
-            and round_idx >= self.attack_start_round
-            ):
-            logger.info(f"client {client_id} is attacker, start stealth front-layer attack")
-            old_model = copy.deepcopy(self.server_model).to(self.device)   # 训练前模型
-            new_model = model.to(self.device)                              # 客户端训练后的模型
-            crafted_model = front_layer_attack(old_model=old_model,new_model=new_model,global_model=self.server_model)
-            _, _test_acc = self.model_evaluate(crafted_model, test_data_loader, criterion)
-            _train_loss, _ = self.model_evaluate(crafted_model, train_data_loader, criterion)
-            return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
-        elif (
-            self.attacker_strategy == "gradient_shift"
-            and client_id in self.attacker_list
-            and round_idx >= self.attack_start_round
-        ):
-            logger.info(f"client {client_id} is attacker, start gradient shifting attack")
-            crafted_model = gradient_shift_attack(
-                model.to(self.device),
-                self.server_model.to(self.device),   # 需要传入上一轮的全局模型 
-                shift_scale=0.03,
-            )
-            _, _test_acc = self.model_evaluate(
-                crafted_model, test_data_loader, criterion
-            )
-            _train_loss, _ = self.model_evaluate(
-                crafted_model, train_data_loader, criterion
-            )
-            return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
-        elif (
             self.attacker_strategy == "badnets"
             and client_id in self.attacker_list
             and round_idx >= self.attack_start_round
@@ -518,36 +493,12 @@ class SimulationFL(ABC):
                 old_model=old_model,
                 new_model=new_model,
                 global_model=self.server_model,
-                align_ratio=0.98,   # ★ 可调
+                align_ratio=0.98, 
             )
 
             _test_loss, _test_acc = self.model_evaluate(crafted_model, test_data_loader, criterion)
             _train_loss, _ = self.model_evaluate(crafted_model, train_data_loader, criterion)
 
-            return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
-        elif (
-            self.attacker_strategy == "pgd_attack"
-            and client_id in self.attacker_list
-            and round_idx >= self.attack_start_round
-        ):
-            logger.info(f"client {client_id} is attacker, start PGD-similarity model poisoning")
-
-         
-            new_model = model.to(self.device)
-            old_model = copy.deepcopy(self.server_model).to(self.device)
-            global_model = self.server_model.to(self.device)
-
-            crafted_model = pgd_attack(
-                old_model=old_model,
-                new_model=new_model,
-                global_model=global_model,
-                step_size=0.1,
-                pgd_steps=5,
-                target_cos=0.95,
-            )
-
-            _test_loss, _test_acc = self.model_evaluate(crafted_model, test_data_loader, criterion)
-            _train_loss, _ = self.model_evaluate(crafted_model, train_data_loader, criterion)
             return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
         elif (
             self.attacker_strategy == "low_rank_attack"
@@ -627,11 +578,28 @@ class SimulationFL(ABC):
                 else:
                     #R = self.attack_radius 
                     # 使用当前近似梯度的 norm 作为参考
-                    benign_like_norm = g_local.norm().item()
-                    alpha = 1.1  # 可调节，范围在 0.5–2 之间
-                    R = benign_like_norm * alpha
-                    
-                    logger.info(f"[ATTACKER {client_id}] benign_like_norm = {benign_like_norm:.4f}, R = {R:.4f}")
+                    #benign_like_norm = g_local.norm().item()
+                    #alpha = 1.15 
+                    #R = benign_like_norm * alpha
+                # 维护一个历史 norm 列表
+                    if not hasattr(self, "norm_history"):
+                        self.norm_history = []
+
+                    self.norm_history.append(g_local.norm().item())
+
+                    # 只保留最近 N 轮的 norm（比如 10 轮）
+                    window_size = 10
+                    if len(self.norm_history) > window_size:
+                        self.norm_history = self.norm_history[-window_size:]
+
+                    # 平滑 norm：取最近 N 轮的平均值
+                    smoothed_norm = np.mean(self.norm_history)
+                    alpha = 1.10   # 可调节
+                    R = smoothed_norm * alpha
+                    # 加约束：避免过大或过小
+                    R_min, R_max = 0.8, 1.5
+                    R = max(min(R, R_max), R_min)
+                    logger.info(f"[ATTACKER {client_id}] smoothed_norm = {smoothed_norm:.4f}, R = {R:.4f}")
                     worst_direction_local = proj / proj.norm() * R
                     
                     logger.info(f"[ATTACKER {client_id}] worst_direction_local norm = {worst_direction_local.norm().item():.4f}")
@@ -778,40 +746,6 @@ class SimulationFL(ABC):
                 for p_id in self.round_client_list[round_idx]
             }
             fused_params = fusion_dual_defense(
-                self.server_model,
-                model_updates,
-                data_sizes,
-                epsilon=self.epsilon,
-            )
-            return fused_params
-        elif self.fusion == "dual_defense2":
-            logger.info("start hyper-guard fusion with epsilon {}".format(self.epsilon))
-            lst_round_attackers = intersection_of_lists(
-                list(model_updates.keys()), self.attacker_list
-            )
-            logger.info(f"round {round_idx} attackers: {lst_round_attackers}")
-            data_sizes = {
-                p_id: sum(len(batch[0]) for batch in self.client_data_loader[p_id][0])
-                for p_id in self.round_client_list[round_idx]
-            }
-            fused_params = fusion_dual_defense2(
-                self.server_model,
-                model_updates,
-                data_sizes,
-                epsilon=self.epsilon,
-            )
-            return fused_params
-        elif self.fusion == "dual_defense3":
-            logger.info("start hyper-guard fusion with epsilon {}".format(self.epsilon))
-            lst_round_attackers = intersection_of_lists(
-                list(model_updates.keys()), self.attacker_list
-            )
-            logger.info(f"round {round_idx} attackers: {lst_round_attackers}")
-            data_sizes = {
-                p_id: sum(len(batch[0]) for batch in self.client_data_loader[p_id][0])
-                for p_id in self.round_client_list[round_idx]
-            }
-            fused_params = fusion_dual_defense3(
                 self.server_model,
                 model_updates,
                 data_sizes,

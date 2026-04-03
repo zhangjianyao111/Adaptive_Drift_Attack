@@ -16,8 +16,8 @@
 Clone the repository and install the dependencies:
 
 ```
-git clone git@github.com:irxyzzz/DualDefense.git
-cd DualDefense
+git clone git@github.com:irxyzzz/DriftDefense.git
+cd DriftDefense
 pip install -r requirements.txt
 ```
 ### Usage

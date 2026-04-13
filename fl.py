@@ -135,7 +135,7 @@ class SimulationFL(ABC):
 
     #每轮参与训练的客户端数量
     def init_client_per_round(self) -> None:
-        num_client_per_round = min(self.num_clients, 10)   #修改此处就能修改最终参与训练的客户端数量
+        num_client_per_round = min(self.num_clients, 10)   #参与训练的客户端数量
         client_list_all = [i for i in range(self.num_clients)]
         round_client_list = []
         if num_client_per_round != self.num_clients:
@@ -344,18 +344,18 @@ class SimulationFL(ABC):
             logger.warning(f"[ATTACKER] client {client_id} using BadNets backdoor attack")
 
             # ====== 所有 BadNets 参数都写在这里 ======
-            TARGET_LABEL = 1          # ★ 目标标签（改这里）
-            POISON_RATIO = 0.3        # ★ 投毒比例（改这里）
-            TRIGGER_SIZE = 3          # ★ 触发器大小（改这里）
+            TARGET_LABEL = 1          # ★ 目标标签
+            POISON_RATIO = 0.3        # ★ 投毒比例
+            TRIGGER_SIZE = 3          # ★ 触发器大小
             # =========================================
 
-            base_dataset = train_data_loader.dataset  # 原始本地训练集（可能是 Subset）
+            base_dataset = train_data_loader.dataset  # 原始本地训练集
 
             poisoned_dataset = BackdoorDataset(
                 base_dataset,
-                target_label=TARGET_LABEL,  # 统一改成目标标签
-                poison_ratio=POISON_RATIO,                # 你可以调，比如 0.1 / 0.2 / 0.3
-                trigger_size=TRIGGER_SIZE                  # 触发器大小
+                target_label=TARGET_LABEL, 
+                poison_ratio=POISON_RATIO,               
+                trigger_size=TRIGGER_SIZE           
             )
             img, label = poisoned_dataset[0]
             print("Trigger region:")
@@ -370,8 +370,8 @@ class SimulationFL(ABC):
                 num_workers=train_data_loader.num_workers,
                 drop_last=False,
             )
-        else:
-            logger.info(f"[BENIGN] client {client_id} clean training")
+        #else:
+            #logger.info(f"[BENIGN] client {client_id} clean training")
         # ===================================
 
  # ===== 标签攻击（Dataset 层）=====
@@ -457,13 +457,23 @@ class SimulationFL(ABC):
             and round_idx >= self.attack_start_round
         ):
             logger.info(f"client {client_id} is attacker, start poisoning model")
-            crafted_model = scaling_attack(model.to(self.device))
+
+            #crafted_model = scaling_attack(model.to(self.device))
+            
+            crafted_model = scaling_attack(
+            local_model=model.to(self.device),
+            fusion=self.fusion,
+            global_model=self.prev_global_model.to(self.device),
+            round_client_list=self.round_client_list[round_idx],
+            attacker_list=self.attacker_list,
+            client_data_loader=self.client_data_loader,
+        )
             _, _test_acc = self.model_evaluate(
                 crafted_model, test_data_loader, criterion
             )
             _train_loss, _ = self.model_evaluate(
                 crafted_model, train_data_loader, criterion
-            )
+            )    
             return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
         elif (
             self.attacker_strategy == "model_poisoning_alie"

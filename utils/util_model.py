@@ -213,17 +213,13 @@ def fang_attack(
     deviation: torch.Tensor,
     n_attackers: int,
 ):
-
     lamda = _fang_attack_compute_lambda(param_updates, param_global, n_attackers)
-
     threshold = 1e-5
     mal_update = []
-
     while lamda > threshold:
         mal_update = -lamda * deviation
         mal_updates = torch.stack([mal_update] * n_attackers)
         mal_updates = torch.cat((mal_updates, param_updates), 0)
-
         # print(mal_updates.shape, n_attackers)
         agg_grads, krum_candidate = _fang_attack_multi_krum(
             mal_updates, n_attackers, multi_k=False
@@ -233,7 +229,6 @@ def fang_attack(
             return mal_update
         else:
             mal_update = []
-
         lamda *= 0.5
 
     if not len(mal_update):
@@ -248,7 +243,6 @@ def aggregation_tailored_attack(
     n_attackers,
     dev_type="sign",
 ):
-
     if dev_type == "unit_vec":
         deviation = param_global / torch.norm(
             param_global
@@ -257,15 +251,12 @@ def aggregation_tailored_attack(
         deviation = torch.sign(param_global)
     elif dev_type == "std":
         deviation = torch.std(param_updates, 0)
-
     lamda = torch.Tensor(
         [20.0]
     ).cuda()  # compute_lambda_our(all_updates, model_re, n_attackers)
-
     threshold_diff = 1e-5
     lamda_fail = lamda
     lamda_succ = 0
-
     while torch.abs(lamda_succ - lamda) > threshold_diff:
         mal_update = param_global - lamda * deviation
         mal_updates = torch.stack([mal_update] * n_attackers)
@@ -274,31 +265,163 @@ def aggregation_tailored_attack(
         agg_grads, krum_candidate = _fang_attack_multi_krum(
             mal_updates, n_attackers, multi_k=True
         )
-
         if np.sum(krum_candidate < n_attackers) == n_attackers:
             # print('successful lamda is ', lamda)
             lamda_succ = lamda
             lamda = lamda + lamda_fail / 2
         else:
             lamda = lamda - lamda_fail / 2
-
         lamda_fail = lamda_fail / 2
-
     mal_update = param_global - lamda_succ * deviation
-
     return mal_update
 
 
-def scaling_attack(model_update: torch.nn.Module):
+def scaling_attack2(model_update: torch.nn.Module):
     params_list = list(model_update.parameters())
     num_params = len(params_list)
-
     for param in params_list:
         param.data *= num_params
     return model_update
 
 
-def alie_attack(model_update: torch.nn.Module, epsilon=0.1):
+
+def scaling_attack1(
+    local_model: torch.nn.Module,
+    global_model: torch.nn.Module,
+    fusion: str, 
+    round_client_list: list,
+    attacker_list: list,
+    client_data_loader: dict,
+    gamma_override: float = None,
+) -> torch.nn.Module:
+    num_selected_clients = len(round_client_list)
+    num_attackers = max(1, len(attacker_list))
+    
+    if gamma_override is not None:
+        gamma = float(gamma_override)
+    else:
+        gamma = num_selected_clients / num_attackers
+
+    attacked_model = copy.deepcopy(local_model)
+
+    with torch.no_grad():
+        global_state = global_model.state_dict()
+        local_state = attacked_model.state_dict()
+
+        for key in local_state.keys():
+            delta = local_state[key] - global_state[key]
+            local_state[key] = global_state[key] + gamma * delta
+
+        attacked_model.load_state_dict(local_state)
+
+    logger.info(
+        f"[scaling_attack] gamma={gamma}, attackers={attacker_list}, selected={round_client_list}"
+    )
+    return attacked_model
+
+
+
+def compute_dataset_size(loader):
+    # ✅ 如果是 tuple（如 train/test）
+    if isinstance(loader, (list, tuple)):
+        loader = loader[0]   # 默认取 train_loader
+
+    # ✅ 标准 DataLoader
+    if hasattr(loader, "dataset"):
+        return len(loader.dataset)
+
+    # ✅ fallback（极端情况）
+    total = 0
+    for batch in loader:
+        if isinstance(batch, (list, tuple)):
+            total += len(batch[0])
+        else:
+            total += len(batch)
+    return total
+
+def clip_tensor(tensor, clip_norm):
+    norm = torch.norm(tensor)
+    if norm > clip_norm:
+        tensor = tensor * (clip_norm / norm)
+    return tensor
+
+def estimate_safe_gamma(delta, reference_norm, max_scale=10.0):
+    """
+    根据当前更新幅度估计一个“不会被明显检测”的 gamma
+    """
+    delta_norm = torch.norm(delta)
+    if delta_norm == 0:
+        return 1.0
+    gamma = reference_norm / delta_norm
+    gamma = min(gamma, max_scale)
+    return gamma
+
+
+def scaling_attack(
+    local_model: torch.nn.Module,
+    global_model: torch.nn.Module,
+    fusion: str,
+    round_client_list: list,
+    attacker_list: list,
+    client_data_loader: dict,
+    gamma_override: float = None,
+    clip_norm: float = None,
+    noise_std: float = 0.0,
+    max_scale: float = 10.0,
+) -> torch.nn.Module:
+    num_selected_clients = len(round_client_list)
+    num_attackers = max(1, len(attacker_list))
+
+    # 1️⃣ 基础 gamma
+    if gamma_override is not None:
+        base_gamma = float(gamma_override)
+    else:
+        total_samples = sum(compute_dataset_size(client_data_loader[pid]) for pid in round_client_list)
+        malicious_samples = sum(compute_dataset_size(client_data_loader[pid]) for pid in attacker_list)
+        malicious_samples = max(1, malicious_samples)
+        base_gamma = total_samples / malicious_samples
+
+    # 2️⃣ 攻击方向
+    direction = -1.0 if fusion not in ["cos_defense", "dual_defense"] else +1.0
+
+    attacked_model = copy.deepcopy(local_model)
+
+    with torch.no_grad():
+        global_state = global_model.state_dict()
+        local_state = attacked_model.state_dict()
+
+        # 3️⃣ 计算整体 delta 范数分布
+        deltas = []
+        for key in local_state.keys():
+            deltas.append(torch.norm(local_state[key] - global_state[key]))
+        median_norm = torch.median(torch.tensor(deltas))
+
+        for key in local_state.keys():
+            delta = local_state[key] - global_state[key]
+
+            # 裁剪
+            if clip_norm is not None:
+                delta = clip_tensor(delta, clip_norm)
+
+            # 自适应 gamma
+            reference_norm = torch.norm(global_state[key])
+            adaptive_gamma = reference_norm / (median_norm + 1e-6)
+            gamma = min(base_gamma, adaptive_gamma, max_scale)
+
+            # 噪声
+            if noise_std > 0:
+                delta = delta + torch.randn_like(delta) * noise_std
+
+            # 更新
+            local_state[key] = global_state[key] + direction * gamma * delta
+
+        attacked_model.load_state_dict(local_state)
+
+    print(f"[smart_scaling_attack] fusion={fusion}, base_gamma={base_gamma:.3f}, direction={direction}, attackers={attacker_list}")
+    return attacked_model
+
+
+def alie_attack(model_update: torch.nn.Module, epsilon=1.0):
     with torch.no_grad():
         for param in model_update.parameters():
             param.add_(torch.randn(param.size(), device=param.device) * epsilon)
@@ -306,22 +429,17 @@ def alie_attack(model_update: torch.nn.Module, epsilon=0.1):
 
 
 def badnets(old_model, new_model, global_model, align_ratio=0.98):
-
     crafted_model = copy.deepcopy(new_model)
-
     new_state = new_model.state_dict()
     global_state = global_model.state_dict()
     crafted_state = crafted_model.state_dict()
 
-    # 找到最后一层的 key（通常是 classifier.weight / classifier.bias）
     last_keys = [k for k in new_state.keys() if "weight" in k or "bias" in k][-2:]
-
     for k in last_keys:
         crafted_state[k] = (
             align_ratio * global_state[k] +
             (1 - align_ratio) * new_state[k]
         )
-
     crafted_model.load_state_dict(crafted_state)
     return crafted_model
 
@@ -329,18 +447,14 @@ def badnets(old_model, new_model, global_model, align_ratio=0.98):
 def low_rank_attack(global_model,worst_direction):
     if worst_direction is None:
         return copy.deepcopy(global_model)
-
     crafted_model = copy.deepcopy(global_model).to(next(global_model.parameters()).device)
-
     flat = worst_direction.to(next(crafted_model.parameters()).device)
     idx = 0
-
     with torch.no_grad():
         for p in crafted_model.parameters():
             numel = p.numel()
             p.add_(flat[idx:idx+numel].view_as(p))
             idx += numel
-
     return crafted_model
 
 

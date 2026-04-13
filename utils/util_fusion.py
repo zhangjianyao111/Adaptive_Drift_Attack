@@ -110,7 +110,7 @@ def fusion_median(
     return median_params
 
 
-def fusion_clipping_median(
+def fusion_clipping_median1(
     model_updates: Dict[int, torch.nn.Module],
     clipping_threshold=0.1,
     device: torch.device = torch.device("cpu"),
@@ -125,7 +125,29 @@ def fusion_clipping_median(
             median_params[key] = torch.clamp(
                 median_params[key], -clipping_threshold, clipping_threshold
             )
+    return median_params
 
+def fusion_clipping_median(
+    model_updates: Dict[int, torch.nn.Module],
+    clipping_threshold=1.0,
+    device: torch.device = torch.device("cpu"),
+) -> Dict[str, Any]:
+    median_params = {}
+    with torch.no_grad():
+        for key in next(iter(model_updates.values())).state_dict():
+            params = torch.stack(
+                [
+                    model.state_dict()[key].to(device).float()
+                    for model in model_updates.values()
+                ]
+            )
+            params = torch.nan_to_num(params, nan=0.0, posinf=1e6, neginf=-1e6)
+            median = wrap_torch_median(params, dim=0, device=device)
+            if isinstance(median, tuple):
+                median = median[0]
+            median_params[key] = torch.clamp(
+                median, -clipping_threshold, clipping_threshold
+            )
     return median_params
 
 
@@ -224,6 +246,22 @@ def fusion_dual_defense(
         client_id: last_layer / torch.norm(last_layer)
         for client_id, last_layer in last_layers.items()
     }
+    
+    '''
+    # --- 改成取所有层并拼接 ---
+    global_all_layers = torch.cat([p.view(-1) for p in global_model.parameters()])
+    all_layers = {
+        client_id: torch.cat([p.view(-1) for p in model.parameters()])
+        for client_id, model in model_updates.items()
+    }
+
+    # --- 归一化改成对全层向量 ---
+    mormalized_global = global_all_layers / torch.norm(global_all_layers)
+    normalized_locals = {
+        client_id: local_vec / torch.norm(local_vec)
+        for client_id, local_vec in all_layers.items()
+    }
+    '''
     # 2) encrypt and send to the fusion server
     encrypted_global = ts.ckks_vector(
         context_ckks, mormalized_global.flatten().tolist()

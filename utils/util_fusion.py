@@ -247,21 +247,6 @@ def fusion_dual_defense(
         for client_id, last_layer in last_layers.items()
     }
     
-    '''
-    # --- 改成取所有层并拼接 ---
-    global_all_layers = torch.cat([p.view(-1) for p in global_model.parameters()])
-    all_layers = {
-        client_id: torch.cat([p.view(-1) for p in model.parameters()])
-        for client_id, model in model_updates.items()
-    }
-
-    # --- 归一化改成对全层向量 ---
-    mormalized_global = global_all_layers / torch.norm(global_all_layers)
-    normalized_locals = {
-        client_id: local_vec / torch.norm(local_vec)
-        for client_id, local_vec in all_layers.items()
-    }
-    '''
     # 2) encrypt and send to the fusion server
     encrypted_global = ts.ckks_vector(
         context_ckks, mormalized_global.flatten().tolist()
@@ -354,9 +339,6 @@ def fusion_dual_defense(
 
 
 
-
-
-
 def drift_defense(
     global_model: torch.nn.Module,
     model_updates: Dict[int, torch.nn.Module],
@@ -429,27 +411,58 @@ def drift_defense(
     # ===== 每个客户端进行选择 =====
     client_selections = {}
     for cid in model_updates.keys():
-        #first_pass = [id for id, s in scores_norm.items() if s >= similarity_threshold]
-        # 第一轮：相似度筛选（区间检测）
+        '''
+        # 第一轮：相似度筛选
         mu_sim = np.mean(list(scores_norm.values()))
         sigma_sim = np.std(list(scores_norm.values()))
         first_pass = [
             id for id, s in scores_norm.items()
             if (mu_sim - sigma_sim) <= s <= (mu_sim + sigma_sim)
     ]
+        
+        # 第二轮：方向贡献筛选
+        #ratios = {id: scores_norm[id] / (norm_scores[id] + 1e-8) for id in first_pass}
+        #mu, sigma = np.mean(list(ratios.values())), np.std(list(ratios.values()))
+        #def energy_ratio_ok(xid):
+        #    return (mu - sigma) <= ratios[xid] <= (mu + sigma)
+        #selected_benigns = [xid for xid in first_pass if energy_ratio_ok(xid)]
+    
 
-        # 第二轮：能量比例筛选
-        ratios = {id: scores_norm[id] / (norm_scores[id] + 1e-8) for id in first_pass}
-        mu, sigma = np.mean(list(ratios.values())), np.std(list(ratios.values()))
-
-        def energy_ratio_ok(xid):
-            return (mu - sigma) <= ratios[xid] <= (mu + sigma)
-
-        selected_benigns = [xid for xid in first_pass if energy_ratio_ok(xid)]
         if len(selected_benigns) == 0:
             raise ValueError(f"Client {cid} 没有选出任何 benign — 检查阈值设置")
         client_selections[cid] = selected_benigns
         logger.info(f"[DEBUG] Client {cid} 投票选择: {selected_benigns}")
+        '''
+
+        '''
+        # 仅保留相似度筛选
+        mu_sim = np.mean(list(scores_norm.values()))
+        sigma_sim = np.std(list(scores_norm.values()))
+        first_pass = [
+            id for id, s in scores_norm.items()
+            if (mu_sim - sigma_sim) <= s <= (mu_sim + sigma_sim)
+        ]
+        selected_benigns = first_pass
+        if len(selected_benigns) == 0:
+            raise ValueError(f"Client {cid} 没有选出任何 benign — 检查相似度阈值设置")
+        client_selections[cid] = selected_benigns
+        logger.info(f"[DEBUG] Client {cid} 相似度投票选择: {selected_benigns}")
+        '''
+
+        
+        # 仅保留方向贡献筛选
+        first_pass = list(scores_norm.keys())
+        ratios = {id: scores_norm[id] / (norm_scores[id] + 1e-8) for id in first_pass}
+        mu, sigma = np.mean(list(ratios.values())), np.std(list(ratios.values()))
+        def energy_ratio_ok(xid):
+            return (mu - sigma) <= ratios[xid] <= (mu + sigma)
+        selected_benigns = [xid for xid in first_pass if energy_ratio_ok(xid)]
+        if len(selected_benigns) == 0:
+            raise ValueError(f"Client {cid} 没有选出任何 benign — 检查方向贡献阈值设置")
+        client_selections[cid] = selected_benigns
+        logger.info(f"[DEBUG] Client {cid} 方向贡献投票选择: {selected_benigns}")
+        
+
 
     # ===== 多数投票（逐元素统计） =====
     element_count = {}
@@ -459,11 +472,9 @@ def drift_defense(
 
     # 取超过半数的客户端 ID
     majority_threshold = len(model_updates) // 2
-    benigns = tuple([bid for bid, cnt in element_count.items() if cnt >= majority_threshold])
-
+    benigns = tuple([bid for bid, cnt in element_count.items() if cnt >= majority_threshold]) 
     if len(benigns) == 0:
         raise ValueError("最终没有任何 benign 客户端被选中 — 检查投票逻辑")
-
     logger.info(f"[DEBUG] 最终多数投票结果: {benigns}")
 
     # ===== 安全聚合 =====

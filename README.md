@@ -12,14 +12,6 @@
 - Python 3.8+
 - Required libraries: PyTorch, tenseal, and others specified in requirements.txt.
 
-### Installation
-Clone the repository and install the dependencies:
-
-```
-git clone git@github.com:irxyzzz/DriftDefense.git
-cd DriftDefense
-pip install -r requirements.txt
-```
 ### Usage
 To run the experiments, refer to `run_test.sh` for a sample script.
 

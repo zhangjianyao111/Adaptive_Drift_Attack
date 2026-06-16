@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
-
+import torch.nn.functional as F
 from utils.util_sys import get_available_device, intersection_of_lists
 from utils.util_data import get_client_data_loader
 from utils.util_data import get_global_test_data_loader
@@ -42,7 +42,7 @@ from utils.util_data import LabelFlipDataset
     # 这里放 compute_benign_subspace
     # ============================================
 
-def compute_benign_subspace(client_updates, k=5):
+def compute_benign_subspace1(client_updates, k=5):
         X = torch.stack(client_updates)  # shape: [num_clients, dim]
         X = X - X.mean(dim=0, keepdim=True)
         if torch.linalg.matrix_rank(X) == 0:
@@ -52,6 +52,193 @@ def compute_benign_subspace(client_updates, k=5):
             U, S, Vt = torch.linalg.svd(X, full_matrices=False)
             subspace = Vt[:k]  # top-k principal directions
             return subspace  # shape: [k, dim]
+
+def compute_benign_subspace(client_updates, k=5):
+    if client_updates is None or len(client_updates) < 2:
+        return None
+
+    valid_updates = []
+
+    for update in client_updates:
+        update = update.detach().flatten().cpu().float()
+
+        # 跳过包含 NaN / Inf 的历史更新
+        if not torch.isfinite(update).all():
+            continue
+
+        valid_updates.append(update)
+
+    if len(valid_updates) < 2:
+        return None
+
+    X = torch.stack(valid_updates, dim=0)  # [num_updates, dim]
+
+    # 双保险：清理 NaN / Inf
+    X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 中心化
+    X = X - X.mean(dim=0, keepdim=True)
+
+    # 不再用 matrix_rank，避免再次调用 SVD
+    if torch.norm(X) < 1e-12:
+        return None
+
+    # k 不能超过样本数和维度
+    k = min(k, X.shape[0] - 1, X.shape[1])
+    if k <= 0:
+        return None
+    try:
+        # 放在 CPU 上做 SVD，更稳定，避免 CUDA cusolver 报错
+        U, S, Vt = torch.linalg.svd(X, full_matrices=False)
+    except RuntimeError as e:
+        print(f"[WARNING] SVD failed in compute_benign_subspace: {e}")
+        return None
+
+    subspace = Vt[:k]  # [k, dim]
+    return subspace
+
+
+
+
+
+
+def compute_benign_subspace(local_updates, k=10, eps=1e-12):
+    if local_updates is None or len(local_updates) < 2:
+        return None
+
+    vectors = []
+
+    for h in local_updates:
+        if not isinstance(h, torch.Tensor):
+            continue
+
+        v = h.detach().cpu().float().view(-1)
+
+        if not torch.isfinite(v).all():
+            v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+
+        vectors.append(v)
+
+    if len(vectors) < 2:
+        return None
+
+    try:
+        X = torch.stack(vectors, dim=0)
+    except RuntimeError:
+        return None
+
+    X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    X = X - X.mean(dim=0, keepdim=True)
+
+    row_norms = X.norm(dim=1)
+    keep = row_norms > eps
+    X = X[keep]
+
+    if X.shape[0] < 2:
+        return None
+
+    if not torch.isfinite(X).all():
+        return None
+
+    if X.norm() < eps:
+        return None
+
+    max_rank = X.shape[0] - 1
+    k = min(k, max_rank)
+
+    if k <= 0:
+        return None
+
+    G = X @ X.t()
+    G = (G + G.t()) / 2.0
+    G = torch.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
+
+    try:
+        eigvals, eigvecs = torch.linalg.eigh(G)
+    except RuntimeError:
+        return None
+
+    if not torch.isfinite(eigvals).all() or not torch.isfinite(eigvecs).all():
+        return None
+
+    idx = torch.argsort(eigvals, descending=True)
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    valid = eigvals > eps
+    r = min(k, int(valid.sum().item()))
+
+    if r <= 0:
+        return None
+
+    eigvals = eigvals[:r]
+    eigvecs = eigvecs[:, :r]
+
+    basis = eigvecs.t() @ X
+    basis = basis / torch.sqrt(eigvals).unsqueeze(1).clamp_min(eps)
+
+    basis = F.normalize(basis, dim=1, eps=eps)
+
+    if not torch.isfinite(basis).all():
+        return None
+
+    return basis
+
+
+def flatten_trainable_params(model: torch.nn.Module) -> torch.Tensor:
+    params = [
+        p.detach().cpu().float().view(-1)
+        for p in model.parameters()
+    ]
+
+    if len(params) == 0:
+        return None
+
+    return torch.cat(params)
+
+
+def flatten_trainable_update(
+    local_model: torch.nn.Module,
+    global_model: torch.nn.Module,
+) -> torch.Tensor:
+    updates = []
+
+    for p_local, p_global in zip(local_model.parameters(), global_model.parameters()):
+        delta = (
+            p_local.detach().cpu().float()
+            - p_global.detach().cpu().float()
+        )
+        updates.append(delta.view(-1))
+
+    if len(updates) == 0:
+        return None
+
+    update = torch.cat(updates)
+    update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return update
+
+
+def flatten_trainable_grad(model: torch.nn.Module) -> torch.Tensor:
+    grads = []
+
+    for p in model.parameters():
+        if p.grad is None:
+            grads.append(torch.zeros_like(p).detach().view(-1))
+        else:
+            grads.append(p.grad.detach().view(-1))
+
+    if len(grads) == 0:
+        return None
+
+    g = torch.cat(grads).float()
+    g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return g
+
+
+
 
 
 
@@ -64,15 +251,15 @@ class SimulationFL(ABC):
         self.dataset = config.get("dataset", "mnist")
         self.fusion = config.get("fusion", "fedavg")
         self.partion_type = config.get("partition_type", "noniid")
-        self.partion_dirichlet_beta = config.get("partition_dirichlet_beta", 0.25)
+        self.partion_dirichlet_beta = config.get("partition_dirichlet_beta", 0.5)
         self.dir_data = config.get("dir_data", "./data/")
 
-        self.training_round = config.get("training_round", 10)
-        self.local_epochs = config.get("local_epochs", 1)
+        self.training_round = config.get("training_round", 60)
+        self.local_epochs = config.get("local_epochs", 3)
         self.optimizer = config.get("optimizer", "sgd")
-        self.learning_rate = config.get("learning_rate", 0.01)
+        self.learning_rate = config.get("learning_rate", 0.05)
         self.batch_size = config.get("batch_size", 64)
-        self.regularization = config.get("regularization", 1e-5)
+        self.regularization = config.get("regularization", 1e-5)  
 
         self.attacker_ratio = config.get("attacker_ratio", 0.0)
         self.attacker_strategy = config.get("attacker_strategy", None)
@@ -266,7 +453,7 @@ class SimulationFL(ABC):
             # simulate aggregation
             aggregated_params = self.aggregate_model(_round_idx, model_dict)
             self.server_model.load_state_dict(aggregated_params)
-
+            
             # RECORD GLOBAL METRICS
             criterion = nn.CrossEntropyLoss().to(self.device)
             _, _test_acc = self.model_evaluate(
@@ -281,7 +468,7 @@ class SimulationFL(ABC):
 
                 clean_test_dataset = self.server_test_data_loader.dataset
 
-                # ===== BadNets 测试参数（与训练保持一致）=====
+                # ===== BadNets 测试参数=====
                 TARGET_LABEL = 1
                 TRIGGER_SIZE = 3
                 # ============================================
@@ -329,6 +516,8 @@ class SimulationFL(ABC):
             json.dump(all_acc, f)
         logger.info("All rounds test accuracy saved to test_acc_log.json")
 
+    
+    
     def client_local_train(
         self, round_idx: int, client_id: int, client_model: nn.Module
     ) -> None:
@@ -458,23 +647,13 @@ class SimulationFL(ABC):
             and round_idx >= self.attack_start_round
         ):
             logger.info(f"client {client_id} is attacker, start poisoning model")
-
-            #crafted_model = scaling_attack(model.to(self.device))
-            
-            crafted_model = scaling_attack(
-            local_model=model.to(self.device),
-            fusion=self.fusion,
-            global_model=self.prev_global_model.to(self.device),
-            round_client_list=self.round_client_list[round_idx],
-            attacker_list=self.attacker_list,
-            client_data_loader=self.client_data_loader,
-        )
+            crafted_model = scaling_attack(model.to(self.device))
             _, _test_acc = self.model_evaluate(
                 crafted_model, test_data_loader, criterion
             )
             _train_loss, _ = self.model_evaluate(
                 crafted_model, train_data_loader, criterion
-            )    
+            )
             return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
         elif (
             self.attacker_strategy == "model_poisoning_alie"
@@ -512,7 +691,7 @@ class SimulationFL(ABC):
 
             return crafted_model, {"train_loss": _train_loss, "test_acc": _test_acc}
         elif (
-            self.attacker_strategy == "low_rank_attack1"  #高相似度正常范数攻击#
+            self.attacker_strategy == "low_rank_attack2"  #高相似度攻击#
             and client_id in self.attacker_list
             and round_idx >= self.attack_start_round
         ):
@@ -629,7 +808,7 @@ class SimulationFL(ABC):
                 "test_acc": _test_acc,
             }
         elif ( 
-            self.attacker_strategy == "low_rank_attack2"   #高范数标准相似度攻击
+            self.attacker_strategy == "low_rank_attack1"   #标准相似度攻击
             and client_id in self.attacker_list
             and round_idx >= self.attack_start_round
         ):
@@ -770,10 +949,10 @@ class SimulationFL(ABC):
                             self.norm_history = self.norm_history[-10:]
 
                         smoothed_norm = np.mean(self.norm_history)
-                        alpha = 5
+                        alpha = 1
                         R = smoothed_norm * alpha
 
-                        R_min, R_max = 0, 200
+                        R_min, R_max = 0, 2
                         R = max(min(R, R_max), R_min)
 
                         logger.info(f"[ATTACKER {client_id}] R = {R:.4f}")
@@ -790,277 +969,296 @@ class SimulationFL(ABC):
             _train_loss, _ = self.model_evaluate(crafted_model, train_data_loader, criterion)
             return crafted_model, {"train_loss": _train_loss,"test_acc": _test_acc,}
         elif (
-            self.attacker_strategy == "low_rank_attack"   # 低相似度低范数攻击（无子空间约束）
+            self.attacker_strategy == "low_rank_attack"  # 高相似度正常范数攻击，CIFAR-10 适配版
             and client_id in self.attacker_list
             and round_idx >= self.attack_start_round
         ):
-            logger.info(f"client {client_id} is attacker, start low-rank subspace poisoning (NO PCA)")
+            logger.info(
+                f"client {client_id} is attacker, "
+                f"start CIFAR-compatible low-rank subspace poisoning"
+            )
 
-            # ===== 1) 历史更新 =====
+            criterion = nn.CrossEntropyLoss().to(self.device)
+
+            # 默认先使用正常本地模型，后面满足条件再替换为 crafted_model
+            local_model_device = model.to(self.device)
+            global_model_device = self.prev_global_model.to(self.device)
+            crafted_model = local_model_device
+
+            # ========== 1) 检查历史更新 ==========
             history = self.client_update_history.get(client_id, [])
             logger.info(f"[ATTACKER {client_id}] history length = {len(history)}")
 
             if len(history) < 2:
-                logger.warning(f"[ATTACKER {client_id}] history too short, fallback benign")
-                crafted_model = model.to(self.device)
+                logger.warning(
+                    f"[ATTACKER {client_id}] history too short ({len(history)}), "
+                    f"fallback to benign update"
+                )
+
             else:
-                # ===== 2) 估计本地梯度 g_local =====
-                approx_model = copy.deepcopy(self.prev_global_model).to(self.device)
-                approx_model.train()
-                approx_model.zero_grad()
+                # ========== 2) 计算当前 benign update，用于确定 CIFAR-10 下的正常范数尺度 ==========
+                current_update_vec = flatten_trainable_update(
+                    local_model=local_model_device,
+                    global_model=global_model_device
+                )
 
-                criterion = nn.CrossEntropyLoss().to(self.device)
-
-                data_iter = iter(train_data_loader)
-                g_accum = None
-
-                for _ in range(5):
-                    try:
-                        data_batch, target_batch = next(data_iter)
-                    except StopIteration:
-                        data_iter = iter(train_data_loader)
-                        data_batch, target_batch = next(data_iter)
-
-                    data_batch = data_batch.to(self.device)
-                    target_batch = target_batch.to(self.device)
-
-                    output = approx_model(data_batch)
-                    loss = criterion(output, target_batch)
-                    loss.backward()
-
-                    grads = []
-                    for p in approx_model.parameters():
-                        if p.grad is not None:
-                            grads.append(p.grad.view(-1))
-                    g = torch.cat(grads).detach()
-
-                    if g_accum is None:
-                        g_accum = g
-                    else:
-                        g_accum += g
-
-                    approx_model.zero_grad()
-
-                g_local = g_accum / 5
-                g_norm = g_local.norm().item()
-                logger.info(f"[ATTACKER {client_id}] g_local norm = {g_norm:.4f}")
-
-                if g_norm < 1e-12:
-                    logger.warning(f"[ATTACKER {client_id}] g_local too small, fallback benign")
-                    crafted_model = model.to(self.device)
-                else:
-                    # ===== 3) 构造参考方向 =====
-                    ref = g_local / (g_local.norm() + 1e-12)
-
-                    # ===== 4) 统计历史贡献度分布 =====
-                    local_updates = [h.to(self.device) for h in history]
-
-                    C_list = []
-                    for h in local_updates:
-                        h_norm_val = h.norm().item()
-                        if h_norm_val < 1e-12:
-                            continue
-                        h_dir = h / (h_norm_val + 1e-12)
-                        cos_h = torch.dot(h_dir, ref).item()
-                        C_list.append(cos_h / (h_norm_val**2 + 1e-12))
-                    if len(C_list) == 0:
-                        logger.warning(f"[ATTACKER {client_id}] empty C_list, fallback benign")
-                        crafted_model = model.to(self.device)
-                    else:
-                        mu_C = np.mean(C_list)
-                        sigma_C = np.std(C_list)
-
-                        target_C_low = mu_C - sigma_C
-                        target_C_high = mu_C + sigma_C
-
-                        logger.info(
-                            f"[ATTACKER {client_id}] target C range = [{target_C_low:.6e}, {target_C_high:.6e}]"
-                        )
-
-                        # ===== 5) 范数控制 =====
-                        alpha_R = 0.8
-                        R = g_norm * alpha_R
-                        logger.info(f"[ATTACKER {client_id}] chosen R = {R:.4f}")
-
-                        # ===== 6) 直接解析构造方向=====
-                        # 目标：贴近下界
-                        target_C = target_C_low + sigma_C * 0.5  
-                        #target_cos = torch.tensor(target_C * (R**2), device=self.device)
-                        target_cos_val = target_C * (R**2)
-
-                        # ===== 核心=====
-                        min_cos = -0.3
-                        if target_cos_val > min_cos:
-                            logger.info(f"[ATTACKER {client_id}] cos too weak ({target_cos_val:.4f}), force to {min_cos}")
-                            target_cos_val = min_cos
-
-                        # ===== 再转 tensor =====
-                        target_cos = torch.tensor(target_cos_val, device=self.device)
-
-                        # 数值安全
-                        target_cos = torch.clamp(target_cos, -1.0, 1.0)
-                        if abs(target_cos.item()) > 0.9999:
-                            logger.warning(f"[ATTACKER {client_id}] target_cos too extreme BEFORE clamp: {target_cos.item():.6f}, "f"C={target_C:.6e}, R={R:.4f}")
-                        # 数值安全
-                        target_cos = torch.clamp(target_cos, -1.0, 1.0)
-                        logger.info(f"[ATTACKER {client_id}] target cos = {target_cos.item():.6f}")
-
-                        # ===== 构造正交方向 =====
-                        rand = torch.randn_like(ref)
-                        rand = rand - torch.dot(rand, ref) * ref
-                        rand = rand / (rand.norm() + 1e-12)
-
-                        # ===== 构造最终方向 =====
-                        sin_val = torch.sqrt(torch.clamp(1 - target_cos**2, min=1e-12))
-
-                        direction = target_cos * ref + sin_val * rand
-                        direction = direction / (direction.norm() + 1e-12)
-
-                        final_cos = torch.dot(direction, ref).item()
-                        final_C = final_cos / (R**2 + 1e-12)
-
-                        logger.info(
-                            f"[ATTACKER {client_id}] final cos = {final_cos:.6f}, final C = {final_C:.6e}"
-                        )
-
-                        # ===== 7) 最终攻击向量 =====
-                        worst_direction_local = direction * R
-
-                        # ===== 8) 构造攻击模型 =====
-                        crafted_model = low_rank_attack(
-                            global_model=self.prev_global_model.to(self.device),
-                            worst_direction=worst_direction_local
-                        )
-
-            # ===== 评估 =====
-            _test_loss, _test_acc = self.model_evaluate(crafted_model, test_data_loader, criterion)
-            _train_loss, _ = self.model_evaluate(crafted_model, train_data_loader, criterion)
-
-            return crafted_model, {
-                "train_loss": _train_loss,
-                "test_acc": _test_acc,
-            }
-        elif (
-            self.attacker_strategy == "low_rank_attack3"  #高相似度高范数攻击#
-            and client_id in self.attacker_list
-            and round_idx >= self.attack_start_round
-        ):
-            logger.info(f"client {client_id} is attacker, start low-rank subspace poisoning")
-
-            # ========== 1) 先确保有足够的历史更新 ==========
-            history = self.client_update_history.get(client_id, [])
-            logger.info(f"[ATTACKER {client_id}] history length = {len(history)}")
-            if len(history) < 2:
-                logger.warning(f"[ATTACKER {client_id}] history too short ({len(history)}), fallback to benign update")
-                crafted_model = model.to(self.device)
-            else:
-                # ========== 2) 用自己的历史更新做 PCA（local trajectory PCA）==========
-                local_updates = [h.to(self.device) for h in history]
-                local_subspace = compute_benign_subspace(local_updates, k=min(10, len(local_updates)))
-                if local_subspace is None:
-                    # rank=0 → 不攻击
-                    return model.to(self.device), {"train_loss": None, "test_acc": None}
-                # 打印 PCA 奇异值（能量分布）
-                U, S, Vt = torch.linalg.svd(torch.stack(local_updates) - torch.stack(local_updates).mean(0), full_matrices=False)
-                logger.info(f"[ATTACKER {client_id}] PCA singular values: {S[:5].cpu().numpy()}")
-
-                # ========== 3) 用“上一轮全局模型 + 本地数据”估计一个梯度方向 ==========
-                approx_model = copy.deepcopy(self.prev_global_model).to(self.device)
-                approx_model.train()
-                approx_model.zero_grad()
-
-                criterion = nn.CrossEntropyLoss().to(self.device)
-
-                # 取5批本地数据来近似 global loss 的梯度
-                data_iter = iter(train_data_loader)
-                g_accum = None
-                for _ in range(5):
-                    try:
-                        data_batch, target_batch = next(data_iter)
-                    except StopIteration:
-                        data_iter = iter(train_data_loader)
-                        data_batch, target_batch = next(data_iter)
-
-                    data_batch = data_batch.to(self.device)
-                    target_batch = target_batch.to(self.device)
-
-                    output = approx_model(data_batch)
-                    loss = criterion(output, target_batch)
-                    loss.backward()
-
-                    grads = []
-                    for p in approx_model.parameters():
-                        if p.grad is not None:
-                            grads.append(p.grad.view(-1))
-                    g = torch.cat(grads).detach()
-
-                    if g_accum is None:
-                        g_accum = g
-                    else:
-                        g_accum += g
-                    approx_model.zero_grad()
-                g_local = g_accum / 5  
-
-                logger.info(f"[ATTACKER {client_id}] g_local norm = {g_local.norm().item():.4f}")
-
-                # ========== 4) 把梯度投影到 local PCA 子空间，得到局部最坏方向 ==========
-                B = local_subspace.to(self.device)        # [k, dim]
-                coeff = torch.matmul(B, g_local)          # [k]
-
-                topk = min(5, coeff.size(0))
-                top_indices = torch.topk(torch.abs(coeff), k=topk).indices
-                proj = torch.matmul(coeff[top_indices], B[top_indices])  # [dim]
-                logger.info(f"[ATTACKER {client_id}] projected grad norm = {proj.norm().item():.4f}")
-
-                if proj.norm() < 1e-12:
-                    logger.warning(f"[ATTACKER {client_id}] projected grad ~ 0, fallback to benign update")
-                    crafted_model = model.to(self.device)
-                else:
-
-                    # ========== ★ 先放大范数（来自 attack2 的大范数版本） ==========
-                    if not hasattr(self, "norm_history"):
-                        self.norm_history = []
-
-                    self.norm_history.append(g_local.norm().item())
-
-                    if len(self.norm_history) > 10:
-                        self.norm_history = self.norm_history[-10:]
-
-                    smoothed_norm = np.mean(self.norm_history)
-
-                    # ★ 大范数：alpha = 5（你可以调）
-                    alpha = 5
-                    R = smoothed_norm * alpha
-
-                    R_min, R_max = 0, 200
-                    R = max(min(R, R_max), R_min)
-
-                    logger.info(f"[ATTACKER {client_id}] enlarged R = {R:.4f}")
-
-                    # ========== ★ 再确定方向（保持 attack1 的原逻辑） ==========
-                    worst_direction_local = proj / proj.norm() * R
-
-                    logger.info(f"[ATTACKER {client_id}] worst_direction_local norm = {worst_direction_local.norm().item():.4f}")
-
-                    # ========== 5) 沿着局部最坏方向，从上一轮全局模型出发构造 poisoned model ==========
-                    crafted_model = low_rank_attack(
-                        global_model=self.prev_global_model.to(self.device),
-                        worst_direction=worst_direction_local
+                if current_update_vec is None or current_update_vec.norm().item() < 1e-12:
+                    logger.warning(
+                        f"[ATTACKER {client_id}] current benign update norm too small, "
+                        f"fallback to benign update"
                     )
+
+                else:
+                    current_update_norm = current_update_vec.norm().item()
+
+                    logger.info(
+                        f"[ATTACKER {client_id}] current benign update norm = "
+                        f"{current_update_norm:.6f}"
+                    )
+
+                    # ========== 3) 处理历史更新，只保留与当前 update 维度一致的向量 ==========
+                    # CIFAR-10 / ResNet 参数量较大，只取最近若干轮历史，避免 CPU 内存过高
+                    history_window_size = 10
+                    recent_history = history[-history_window_size:]
+
+                    local_updates = []
+
+                    for h in recent_history:
+                        if not isinstance(h, torch.Tensor):
+                            continue
+
+                        h_vec = h.detach().cpu().float().view(-1)
+                        h_vec = torch.nan_to_num(
+                            h_vec,
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0
+                        )
+
+                        if h_vec.numel() == current_update_vec.numel():
+                            local_updates.append(h_vec)
+
+                    logger.info(
+                        f"[ATTACKER {client_id}] valid history length after dim check = "
+                        f"{len(local_updates)}"
+                    )
+
+                    if len(local_updates) < 2:
+                        logger.warning(
+                            f"[ATTACKER {client_id}] valid history too short after dim check, "
+                            f"fallback to benign update"
+                        )
+
+                    else:
+                        # ========== 4) 用 Gram-PCA 构造历史子空间 ==========
+                        # CIFAR-10 上不要直接 torch.linalg.svd(torch.stack(...))
+                        dataset_name = str(getattr(self, "dataset", "")).lower()
+
+                        if "cifar" in dataset_name:
+                            k_pca = min(5, len(local_updates))
+                        else:
+                            k_pca = min(10, len(local_updates))
+
+                        local_subspace = compute_benign_subspace(
+                            local_updates,
+                            k=k_pca
+                        )
+
+                        if local_subspace is None:
+                            logger.warning(
+                                f"[ATTACKER {client_id}] local_subspace is None, "
+                                f"fallback to benign update"
+                            )
+
+                        else:
+                            logger.info(
+                                f"[ATTACKER {client_id}] local_subspace shape = "
+                                f"{tuple(local_subspace.shape)}"
+                            )
+
+                            # ========== 5) 用上一轮全局模型 + 本地数据估计梯度方向 ==========
+                            approx_model = copy.deepcopy(self.prev_global_model).to(self.device)
+                            approx_model.train()
+                            approx_model.zero_grad()
+
+                            # CIFAR-10 上少取几个 batch，降低显存和时间开销
+                            grad_batches = 3 if "cifar" in dataset_name else 5
+
+                            data_iter = iter(train_data_loader)
+                            g_accum = None
+                            used_batches = 0
+
+                            for _ in range(grad_batches):
+                                try:
+                                    data_batch, target_batch = next(data_iter)
+                                except StopIteration:
+                                    data_iter = iter(train_data_loader)
+                                    data_batch, target_batch = next(data_iter)
+
+                                data_batch = data_batch.to(self.device)
+                                target_batch = target_batch.to(self.device)
+
+                                output = approx_model(data_batch)
+                                loss = criterion(output, target_batch)
+                                loss.backward()
+
+                                # 关键：用 flatten_trainable_grad，保证梯度维度和 update 维度一致
+                                g = flatten_trainable_grad(approx_model)
+                                if g is None:
+                                    approx_model.zero_grad()
+                                    continue
+                                g = g.detach().cpu()
+
+                                if g_accum is None:
+                                    g_accum = g
+                                else:
+                                    g_accum += g
+
+                                used_batches += 1
+                                approx_model.zero_grad()
+
+                            if g_accum is None or used_batches == 0:
+                                logger.warning(
+                                    f"[ATTACKER {client_id}] failed to estimate gradient, "
+                                    f"fallback to benign update"
+                                )
+                            else:
+                                g_local = g_accum / used_batches
+                                g_local = torch.nan_to_num(
+                                    g_local,
+                                    nan=0.0,
+                                    posinf=0.0,
+                                    neginf=0.0
+                                )
+                                logger.info(
+                                    f"[ATTACKER {client_id}] g_local norm = "
+                                    f"{g_local.norm().item():.6f}"
+                                )
+
+                                # ========== 6) 检查 PCA 子空间和梯度维度 ==========
+                                B = local_subspace.cpu()       # [k, dim]
+                                g_cpu = g_local.cpu()          # [dim]
+
+                                if B.shape[1] != g_cpu.numel():
+                                    logger.warning(
+                                        f"[ATTACKER {client_id}] dim mismatch: "
+                                        f"B_dim={B.shape[1]}, g_dim={g_cpu.numel()}, "
+                                        f"fallback to benign update"
+                                    )
+
+                                else:
+                                    # ========== 7) 将梯度投影到历史 PCA 子空间 ==========
+                                    coeff = torch.matmul(B, g_cpu)  # [k]
+
+                                    topk = min(5, coeff.size(0))
+                                    top_indices = torch.topk(
+                                        torch.abs(coeff),
+                                        k=topk
+                                    ).indices
+
+                                    proj = torch.matmul(
+                                        coeff[top_indices],
+                                        B[top_indices]
+                                    )  # [dim]
+
+                                    proj = torch.nan_to_num(
+                                        proj,
+                                        nan=0.0,
+                                        posinf=0.0,
+                                        neginf=0.0
+                                    )
+
+                                    proj_norm = proj.norm().item()
+
+                                    logger.info(
+                                        f"[ATTACKER {client_id}] projected grad norm = "
+                                        f"{proj_norm:.6f}"
+                                    )
+
+                                    if proj_norm < 1e-12:
+                                        logger.warning(
+                                            f"[ATTACKER {client_id}] projected grad ~ 0, "
+                                            f"fallback to benign update"
+                                        )
+
+                                    else:
+                                        # ========== 8) 每个攻击者单独维护 update norm 历史 ==========
+                                        if not hasattr(self, "norm_history") or not isinstance(self.norm_history, dict):
+                                            self.norm_history = {}
+
+                                        if client_id not in self.norm_history:
+                                            self.norm_history[client_id] = []
+
+                                        self.norm_history[client_id].append(current_update_norm)
+
+                                        window_size = 10
+                                        if len(self.norm_history[client_id]) > window_size:
+                                            self.norm_history[client_id] = self.norm_history[client_id][-window_size:]
+
+                                        smoothed_norm = float(np.mean(self.norm_history[client_id]))
+
+                                        # ========== 9) CIFAR-10 自适应正常范数攻击半径 ==========
+                                        # 让 R 与当前正常 update norm 同尺度，避免变成高范数攻击
+                                        if "cifar" in dataset_name:
+                                            alpha = 1.10
+                                            R_min = 0.7 * current_update_norm
+                                            R_max = 1.3 * current_update_norm
+                                        else:
+                                            alpha = 1.10
+                                            R_min = 0.8
+                                            R_max = 1.5
+                                        #R_min = 0.7 * current_update_norm
+                                        #R_max = 1.3 * current_update_norm
+                                        R = smoothed_norm * alpha
+                                        R = max(min(R, R_max), R_min)
+
+                                        logger.info(
+                                            f"[ATTACKER {client_id}] smoothed_update_norm = "
+                                            f"{smoothed_norm:.6f}, R = {R:.6f}, "
+                                            f"R_range=[{R_min:.6f}, {R_max:.6f}]"
+                                        )
+
+                                        worst_direction_local = proj / (proj_norm + 1e-12) * R
+                                        worst_direction_local = torch.nan_to_num(
+                                            worst_direction_local,
+                                            nan=0.0,
+                                            posinf=0.0,
+                                            neginf=0.0
+                                        )
+
+                                        logger.info(
+                                            f"[ATTACKER {client_id}] worst_direction_local norm = "
+                                            f"{worst_direction_local.norm().item():.6f}"
+                                        )
+
+                                        # ========== 10) 从上一轮全局模型出发构造 poisoned model ==========
+                                        crafted_model = low_rank_attack(
+                                            global_model=global_model_device,
+                                            worst_direction=worst_direction_local.to(self.device)
+                                        )
+
+                            # 释放临时模型，降低 CIFAR-10 显存压力
+                            del approx_model
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
 
             # ====== 评估 ======
             _test_loss, _test_acc = self.model_evaluate(
-                crafted_model, test_data_loader, criterion
+                crafted_model,
+                test_data_loader,
+                criterion
             )
+
             _train_loss, _ = self.model_evaluate(
-                crafted_model, train_data_loader, criterion
+                crafted_model,
+                train_data_loader,
+                criterion
             )
 
             return crafted_model, {
                 "train_loss": _train_loss,
                 "test_acc": _test_acc,
-            }
-
+            }        
         else:
             _test_loss, _test_acc = self.model_evaluate(
                 model, test_data_loader, criterion
